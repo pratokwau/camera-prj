@@ -31,14 +31,17 @@ AR-проект на Python: камера захватывает руку, а к
 git clone https://github.com/pratokwau/camera-prj.git
 cd camera-prj
 
-# Виртуальное окружение (рекомендуется)
-python -m venv venv
-source venv/bin/activate  # Linux/macOS
-# venv\Scripts\activate   # Windows
-
 # Зависимости
 pip install -r requirements.txt
 ```
+
+> **Про виртуальное окружение:** оно не обязательно. Если у тебя Python 3.9+ и пакеты не конфликтуют с другими проектами — можно ставить глобально и запускать. Если хочешь чистоту, создай виртуалку:
+> ```bash
+> python -m venv venv
+> source venv/bin/activate  # Linux/macOS
+> # venv\Scripts\activate   # Windows
+> pip install -r requirements.txt
+> ```
 
 ## Запуск
 
