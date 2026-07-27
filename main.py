@@ -239,6 +239,11 @@ class AROverlay:
         """
         h_img, w_img = image.shape[:2]
 
+        # Если картинка без альфа-канала — добавляем (непрозрачный)
+        if image.shape[2] == 3:
+            alpha_channel = np.full((h_img, w_img, 1), 255, dtype=np.uint8)
+            image = np.concatenate([image, alpha_channel], axis=2)
+
         # Исходные 4 угла картинки
         pts_src = np.float32([
             [0, 0],
@@ -253,29 +258,21 @@ class AROverlay:
         # Матрица перспективного преобразования
         M = cv2.getPerspectiveTransform(pts_src, pts_dst_np)
 
-        # Размер выходного холста = размер кадра
+        # Варпим картинку и альфа-маску отдельно
         h_frame, w_frame = frame.shape[:2]
-        warped = cv2.warpPerspective(
-            image, M, (w_frame, h_frame),
-            borderMode=cv2.BORDER_TRANSPARENT,
-        )
+        warped_rgb = cv2.warpPerspective(image[:, :, :3], M, (w_frame, h_frame))
+        warped_alpha = cv2.warpPerspective(image[:, :, 3], M, (w_frame, h_frame))
 
-        # Наложение с учётом альфа-канала (если есть)
-        if warped.shape[2] == 4:
-            # Разделяем цвет и маску
-            alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
-            rgb = warped[:, :, :3].astype(np.float32)
-            frame_float = frame.astype(np.float32)
-            blended = (rgb * alpha + frame_float * (1 - alpha)).astype(np.uint8)
-            return blended
-        else:
-            # Без альфа: маска по нечёрным пикселям
-            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-            _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
-            mask_inv = cv2.bitwise_not(mask)
-            bg = cv2.bitwise_and(frame, frame, mask=mask_inv)
-            fg = cv2.bitwise_and(warped, warped, mask=mask)
-            return cv2.add(bg, fg)
+        # Альфа-маска: 0..1
+        alpha = warped_alpha.astype(np.float32) / 255.0
+        alpha = np.stack([alpha] * 3, axis=-1)  # (H, W, 3)
+
+        # Чистое альфа-наложение
+        frame_f = frame.astype(np.float32)
+        warped_f = warped_rgb.astype(np.float32)
+        blended = (warped_f * alpha + frame_f * (1.0 - alpha)).astype(np.uint8)
+
+        return blended
 
 
 # ──────────────────────────────────────────────────────────────────────────────
