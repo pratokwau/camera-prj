@@ -28,8 +28,8 @@ AR-проект на Python: камера захватывает руку, а к
 
 ```bash
 # Клонируй
-git clone https://github.com/<твой-юзернейм>/finger-ar-overlay.git
-cd finger-ar-overlay
+git clone https://github.com/pratokwau/camera-prj.git
+cd camera-prj
 
 # Виртуальное окружение (рекомендуется)
 python -m venv venv
@@ -60,7 +60,7 @@ python main.py
 ## Структура проекта
 
 ```
-finger-ar-overlay/
+camera-prj/
 ├── main.py              # Главный файл
 ├── requirements.txt     # Зависимости
 ├── images/              # Сюда кидай картинки (png/jpg/webp)
