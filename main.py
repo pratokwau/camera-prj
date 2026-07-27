@@ -131,16 +131,15 @@ class HandDetector:
         self.cfg = cfg
         self._download_model_if_needed(cfg.model_path, cfg.model_url)
 
-        from mediapipe.tasks.python import BaseOptions
-        from mediapipe.tasks.python.vision import (
-            HandLandmarker,
-            HandLandmarkerOptions,
-            VisionRunningMode,
-        )
+        # Правильные импорты для MediaPipe 0.10.x
+        BaseOptions = mp.tasks.BaseOptions
+        HandLandmarker = mp.tasks.vision.HandLandmarker
+        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        RunningMode = mp.tasks.vision.RunningMode  # НЕ VisionRunningMode!
 
         options = HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=cfg.model_path),
-            running_mode=VisionRunningMode.IMAGE,
+            running_mode=RunningMode.IMAGE,
             num_hands=cfg.max_num_hands,
             min_hand_detection_confidence=cfg.min_detection_confidence,
             min_hand_presence_confidence=cfg.min_detection_confidence,
