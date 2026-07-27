@@ -25,8 +25,14 @@ import os
 import glob
 import time
 import urllib.request
+import logging
 from dataclasses import dataclass
 from typing import Optional
+
+# Подавляем libpng warning
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+cv2.setLogLevel(0)
+logging.getLogger().setLevel(logging.ERROR)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -88,7 +94,7 @@ class ImageLoader:
         img = cv2.imread(self.paths[self.current_idx], cv2.IMREAD_UNCHANGED)
         if img is None:
             return None
-        # Конвертируем в BGR или BGRA
+        # Конвертируем в BGR или BGRA (тихий импорт без libpng warning)
         if len(img.shape) == 2:
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         elif img.shape[2] == 3:
@@ -287,6 +293,9 @@ class FingerARApp:
         self.overlay = AROverlay()
         self.cap: Optional[cv2.VideoCapture] = None
         self.last_fingertips: Optional[list] = None
+        self.smoothed_fingertips: Optional[list] = None
+        self.SMOOTH_FACTOR: float = 0.35  # 0=макс плавность, 1=без сглаживания
+        self.hand_visible: bool = False  # рука видна прямо сейчас
         self.hand_lost_time: float = 0
         self.HAND_LOST_TIMEOUT: float = 1.0  # секунд держим последнюю позу
 
@@ -313,8 +322,8 @@ class FingerARApp:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         cv2.putText(frame, "1-4:выбор SPACE:след S:скриншот Q:выход", (20, 100),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
-        status = "Рука найдена" if self.last_fingertips else "Покажи руку!"
-        color = (0, 255, 0) if self.last_fingertips else (0, 0, 255)
+        status = "Рука найдена" if self.hand_visible else "Покажи руку!"
+        color = (0, 255, 0) if self.hand_visible else (0, 0, 255)
         cv2.putText(frame, status, (20, 130),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
@@ -347,10 +356,23 @@ class FingerARApp:
                 frame, fingertips = self.detector.process(frame)
 
                 if fingertips:
-                    self.last_fingertips = fingertips
+                    self.hand_visible = True
+                    # Экспоненциальное сглаживание
+                    if self.smoothed_fingertips is None:
+                        self.smoothed_fingertips = [list(p) for p in fingertips]
+                    else:
+                        for i in range(4):
+                            old = self.smoothed_fingertips[i]
+                            new = fingertips[i]
+                            old[0] = old[0] * (1 - self.SMOOTH_FACTOR) + new[0] * self.SMOOTH_FACTOR
+                            old[1] = old[1] * (1 - self.SMOOTH_FACTOR) + new[1] * self.SMOOTH_FACTOR
+                    self.last_fingertips = [(int(p[0]), int(p[1])) for p in self.smoothed_fingertips]
                     self.hand_lost_time = 0
                 else:
-                    self.hand_lost_time += 1 / 30  # ~30 fps
+                    self.hand_visible = False
+                    self.hand_lost_time += 1 / 30
+                    if self.hand_lost_time > self.HAND_LOST_TIMEOUT:
+                        self.smoothed_fingertips = None
 
                 # Накладываем картинку
                 image = self.loader.current()
