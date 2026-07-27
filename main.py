@@ -1,11 +1,11 @@
 """
 Finger AR Overlay — привязка картинки к кончикам пальцев через камеру.
 
-Стек: OpenCV (камера) + MediaPipe Hands (21 landmark) + warpPerspective (AR-оверлей).
+Стек: OpenCV (камера) + MediaPipe Tasks Vision (HandLandmarker) + warpPerspective (AR-оверлей).
 
 Как работает:
     1. Камера захватывает кадр.
-    2. MediaPipe находит руку и 21 точку (landmark).
+    2. MediaPipe HandLandmarker находит руку и 21 точку (landmark).
     3. Кончики 4 пальцев (index/middle/ring/pinky → точки 8/12/16/20)
        задают 4 угла перспективного преобразования.
     4. Картинка из images/ накладывается на кадр через warpPerspective.
@@ -24,6 +24,7 @@ import numpy as np
 import os
 import glob
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
@@ -38,12 +39,14 @@ class Config:
     camera_width: int = 1280
     camera_height: int = 720
     max_num_hands: int = 1
-    min_detection_confidence: float = 0.7
+    min_detection_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
     # Индексы кончиков пальцев в MediaPipe (8=index, 12=middle, 16=ring, 20=pinky)
     fingertip_ids: tuple = (8, 12, 16, 20)
     images_dir: str = "images"
     screenshot_dir: str = "screenshots"
+    model_path: str = "hand_landmarker.task"
+    model_url: str = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -108,48 +111,79 @@ class ImageLoader:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Детектор руки
+# Детектор руки (MediaPipe Tasks Vision API)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HandDetector:
-    """Обёртка над MediaPipe Hands."""
+    """Обёртка над MediaPipe HandLandmarker (новый API)."""
+
+    # Соединения для рисования скелета (пары индексов)
+    HAND_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4),      # большой
+        (0, 5), (5, 6), (6, 7), (7, 8),      # указательный
+        (0, 9), (9, 10), (10, 11), (11, 12), # средний
+        (0, 13), (13, 14), (14, 15), (15, 16), # безымянный
+        (0, 17), (17, 18), (18, 19), (19, 20), # мизинец
+        (5, 9), (9, 13), (13, 17),           # ладонь
+    ]
 
     def __init__(self, cfg: Config):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=cfg.max_num_hands,
-            min_detection_confidence=cfg.min_detection_confidence,
+        self.cfg = cfg
+        self._download_model_if_needed(cfg.model_path, cfg.model_url)
+
+        BaseOptions = mp.tasks.BaseOptions
+        HandLandmarker = mp.tasks.vision.HandLandmarker
+        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.VisionRunningMode
+
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=cfg.model_path),
+            running_mode=VisionRunningMode.IMAGE,
+            num_hands=cfg.max_num_hands,
+            min_hand_detection_confidence=cfg.min_detection_confidence,
+            min_hand_presence_confidence=cfg.min_detection_confidence,
             min_tracking_confidence=cfg.min_tracking_confidence,
         )
-        self.mp_draw = mp.solutions.drawing_utils
-        self.mp_styles = mp.solutions.drawing_styles
+        self.landmarker = HandLandmarker.create_from_options(options)
+
+    @staticmethod
+    def _download_model_if_needed(path: str, url: str) -> None:
+        if os.path.exists(path):
+            return
+        print(f"[HandDetector] Скачиваю модель {path} ...")
+        try:
+            urllib.request.urlretrieve(url, path)
+            print(f"[HandDetector] Модель скачана: {path}")
+        except Exception as e:
+            print(f"[HandDetector] Ошибка скачивания: {e}")
+            print(f"Скачай вручную: {url}")
+            print(f"Или установи старую версию: pip install mediapipe==0.10.9")
+            raise
 
     def process(self, frame: np.ndarray) -> tuple[np.ndarray, Optional[list]]:
         """
         Возвращает (аннотированный кадр, список кончиков пальцев в пикселях).
         Список = [(x0,y0), (x1,y1), (x2,y2), (x3,y3)] или None если рука не найдена.
         """
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
+        h, w = frame.shape[:2]
         fingertips = None
 
-        if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
-            h, w = frame.shape[:2]
+        # Конвертируем BGR → RGB для MediaPipe
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        result = self.landmarker.detect(mp_image)
+
+        if result.hand_landmarks:
+            landmarks = result.hand_landmarks[0]  # первая рука
             fingertips = []
-            for idx in Config().fingertip_ids:
-                lm = hand_landmarks.landmark[idx]
+            for idx in self.cfg.fingertip_ids:
+                lm = landmarks[idx]
                 px, py = int(lm.x * w), int(lm.y * h)
                 fingertips.append((px, py))
+
             # Рисуем скелет
-            self.mp_draw.draw_landmarks(
-                frame,
-                hand_landmarks,
-                self.mp_hands.HAND_CONNECTIONS,
-                self.mp_styles.get_default_hand_landmarks_style(),
-                self.mp_styles.get_default_hand_connections_style(),
-            )
+            self._draw_skeleton(frame, landmarks, w, h)
             # Подсвечиваем кончики
             for (px, py) in fingertips:
                 cv2.circle(frame, (px, py), 10, (0, 255, 255), -1)
@@ -157,8 +191,18 @@ class HandDetector:
 
         return frame, fingertips
 
+    def _draw_skeleton(self, frame: np.ndarray, landmarks, w: int, h: int) -> None:
+        """Рисует соединения скелета вручную."""
+        points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
+        for (i, j) in self.HAND_CONNECTIONS:
+            cv2.line(frame, points[i], points[j], (0, 255, 0), 2)
+        # Суставы
+        for pt in points:
+            cv2.circle(frame, pt, 4, (0, 0, 255), -1)
+
     def close(self) -> None:
-        self.hands.close()
+        if hasattr(self, 'landmarker'):
+            self.landmarker.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
