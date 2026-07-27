@@ -41,8 +41,9 @@ class Config:
     max_num_hands: int = 1
     min_detection_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
-    # Индексы кончиков пальцев в MediaPipe (8=index, 12=middle, 16=ring, 20=pinky)
-    fingertip_ids: tuple = (8, 12, 16, 20)
+    # 4 точки: большой палец(4), указательный(8), безымянный(16), мизинец(20)
+    # thumb даёт широкий охват — картинка не переворачивается
+    fingertip_ids: tuple = (4, 8, 16, 20)
     images_dir: str = "images"
     screenshot_dir: str = "screenshots"
     model_path: str = "hand_landmarker.task"
@@ -214,6 +215,22 @@ class AROverlay:
     """Накладывает картинку на кадр по 4 точкам через перспективное преобразование."""
 
     @staticmethod
+    def _sort_corners(pts: list) -> list:
+        """
+        Сортирует 4 точки в порядке: top-left, top-right, bottom-right, bottom-left.
+        Без этого картинка может переворачиваться/поворачиваться.
+        """
+        arr = np.array(pts, dtype=np.float32)
+        # top-left = min(x+y), bottom-right = max(x+y)
+        s = arr.sum(axis=1)
+        d = np.diff(arr, axis=1).flatten()  # y - x
+        tl = arr[np.argmin(s)]
+        br = arr[np.argmax(s)]
+        tr = arr[np.argmin(d)]
+        bl = arr[np.argmax(d)]
+        return [tl.tolist(), tr.tolist(), br.tolist(), bl.tolist()]
+
+    @staticmethod
     def overlay(frame: np.ndarray, image: np.ndarray, pts_dst: list) -> np.ndarray:
         """
         frame  — кадр камеры (H, W, 3)
@@ -229,6 +246,8 @@ class AROverlay:
             [w_img, h_img],
             [0, h_img],
         ])
+        # Сортируем точки чтобы картинка не переворачивалась
+        pts_dst = AROverlay._sort_corners(pts_dst)
         pts_dst_np = np.float32(pts_dst)
 
         # Матрица перспективного преобразования
