@@ -25,14 +25,11 @@ import os
 import glob
 import time
 import urllib.request
-import logging
 from dataclasses import dataclass
 from typing import Optional
 
 # Подавляем libpng warning
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
-cv2.setLogLevel(0)
-logging.getLogger().setLevel(logging.ERROR)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
