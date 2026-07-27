@@ -4,9 +4,11 @@ Finger AR Overlay — привязка картинки к кончикам па
 Стек: OpenCV (камера) + MediaPipe Tasks Vision (HandLandmarker) + warpPerspective (AR-оверлей).
 
 Режимы:
-    1 рука  — 4 кончика пальцев = 4 угла картинки (перспектива).
-    2 руки  — левая = якорь (угол), правая = растяжение (противоположный угол).
-              Картинка растягивается между двумя ладонями, пропорции сохраняются.
+    1 рука (правая) — 4 кончика пальцев = 4 угла картинки (перспектива).
+    2 руки — правая держит картинку, левая щипком захватывает угол и тянет.
+
+Левая рука: pinch (щипок = большой + указательный пальцы рядом) рядом с углом
+            = захват. Двигаешь рукой — угол тянется. Разжал пальцы — отпустил.
 
 Управление:
     1-4 — выбор картинки из списка
@@ -25,7 +27,6 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
-# Подавляем libpng warning
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
 
@@ -38,21 +39,17 @@ class Config:
     camera_index: int = 0
     camera_width: int = 1280
     camera_height: int = 720
-    max_num_hands: int = 2  # поддержка двух рук
+    max_num_hands: int = 2
     min_detection_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
-    # 4 точки: большой палец(4), указательный(8), безымянный(16), мизинец(20)
-    fingertip_ids: tuple = (4, 8, 16, 20)
-    # Ладонь = среднее между wrist(0) и middle_finger_mcp(9)
-    palm_point_ids: tuple = (0, 9)
+    fingertip_ids: tuple = (4, 8, 16, 20)  # thumb, index, ring, pinky
     images_dir: str = "images"
     screenshot_dir: str = "screenshots"
     model_path: str = "hand_landmarker.task"
     model_url: str = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-    # Минимальное расстояние между соседними углами (px) — защита от схлопывания
-    min_corner_dist: int = 20
-    # Паддинг вокруг двух ладоней (px)
-    two_hand_padding: int = 60
+    min_corner_dist: int = 20       # мин расстояние между углами
+    pinch_threshold: float = 50.0   # px — расстояние thumb-index для щипка
+    grab_radius: float = 80.0       # px — радиус захвата угла щипком
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -60,8 +57,6 @@ class Config:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ImageLoader:
-    """Сканирует images/ и держит список доступных картинок."""
-
     SUPPORTED_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
     def __init__(self, images_dir: str):
@@ -112,12 +107,10 @@ class ImageLoader:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Детектор руки (MediaPipe Tasks Vision API)
+# Детектор руки
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HandDetector:
-    """Обёртка над MediaPipe HandLandmarker. Поддержка 1 и 2 рук."""
-
     HAND_CONNECTIONS = [
         (0, 1), (1, 2), (2, 3), (3, 4),
         (0, 5), (5, 6), (6, 7), (7, 8),
@@ -155,101 +148,89 @@ class HandDetector:
             urllib.request.urlretrieve(url, path)
             print(f"[HandDetector] Модель скачана: {path}")
         except Exception as e:
-            print(f"[HandDetector] Ошибка скачивания: {e}")
-            print(f"Скачай вручную: {url}")
+            print(f"[HandDetector] Ошибка: {e}")
             raise
 
     def process(self, frame: np.ndarray) -> dict:
         """
         Возвращает dict:
-            {
-                'frame': annotated_frame,
-                'mode': 'none' | 'single' | 'dual',
-                'fingertips': [(x,y)]*4  (single mode),
-                'palms': [(x,y), (x,y)]  (dual mode),
-                'hands_data': list of raw landmarks (for drawing),
-            }
+            'frame':      аннотированный кадр
+            'hands':      список словарей для каждой руки:
+                { 'label': 'Right'|'Left',
+                  'fingertips': [(x,y)]*4,
+                  'pinch_point': (x,y),  — середина между thumb и index
+                  'pinching': bool,
+                  'landmarks': raw }
         """
         h, w = frame.shape[:2]
-        result_data = {
-            'frame': frame,
-            'mode': 'none',
-            'fingertips': None,
-            'palms': None,
-            'hands_data': [],
-        }
+        hands = []
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         result = self.landmarker.detect(mp_image)
 
-        if not result.hand_landmarks:
-            return result_data
+        if result.hand_landmarks:
+            for i, lm_list in enumerate(result.hand_landmarks):
+                # Определяем левая/правая
+                label = "Right"
+                if result.handedness and i < len(result.handedness):
+                    label = result.handedness[i][0].category_name
+                    # MediaPipe зеркалит: "Right" на самом деле левая рука
+                    # Мы зеркалим кадр → инвертируем
+                    label = "Left" if label == "Right" else "Right"
 
-        hands_count = len(result.hand_landmarks)
-        result_data['hands_data'] = result.hand_landmarks
+                # Кончики пальцев
+                fingertips = []
+                for idx in self.cfg.fingertip_ids:
+                    lm = lm_list[idx]
+                    fingertips.append((int(lm.x * w), int(lm.y * h)))
 
-        # Рисуем все руки
-        for hand_lm in result.hand_landmarks:
-            self._draw_skeleton(frame, hand_lm, w, h)
+                # Щипок: расстояние thumb tip (4) — index tip (8)
+                tx, ty = lm_list[4].x * w, lm_list[4].y * h
+                ix, iy = lm_list[8].x * w, lm_list[8].y * h
+                pinch_dist = ((tx - ix) ** 2 + (ty - iy) ** 2) ** 0.5
+                pinch_point = (int((tx + ix) / 2), int((ty + iy) / 2))
+                pinching = pinch_dist < self.cfg.pinch_threshold
 
-        if hands_count >= 2:
-            # === DUAL MODE: 2 руки → пальмы = якорь и растяжение ===
-            palm0 = self._get_palm_center(result.hand_landmarks[0], w, h)
-            palm1 = self._get_palm_center(result.hand_landmarks[1], w, h)
-            result_data['mode'] = 'dual'
-            result_data['palms'] = [palm0, palm1]
-            # Подсвечиваем центры ладоней
-            cv2.circle(frame, palm0, 15, (255, 0, 255), -1)
-            cv2.circle(frame, palm1, 15, (255, 0, 255), -1)
-            cv2.line(frame, palm0, palm1, (255, 255, 0), 2)
-        else:
-            # === SINGLE MODE: 1 рука → 4 кончика пальцев ===
-            landmarks = result.hand_landmarks[0]
-            fingertips = []
-            for idx in self.cfg.fingertip_ids:
-                lm = landmarks[idx]
-                px, py = int(lm.x * w), int(lm.y * h)
-                fingertips.append((px, py))
-            result_data['mode'] = 'single'
-            result_data['fingertips'] = fingertips
-            # Подсвечиваем кончики
-            for (px, py) in fingertips:
-                cv2.circle(frame, (px, py), 10, (0, 255, 255), -1)
-                cv2.circle(frame, (px, py), 12, (0, 0, 255), 2)
+                # Рисуем скелет
+                self._draw_skeleton(frame, lm_list, w, h)
 
-        return result_data
+                hands.append({
+                    'label': label,
+                    'fingertips': fingertips,
+                    'pinch_point': pinch_point,
+                    'pinching': pinching,
+                    'landmarks': lm_list,
+                })
 
-    def _get_palm_center(self, landmarks, w: int, h: int) -> tuple:
-        """Центр ладони = среднее между wrist(0) и middle_mcp(9)."""
-        p0 = landmarks[self.cfg.palm_point_ids[0]]
-        p1 = landmarks[self.cfg.palm_point_ids[1]]
-        cx = int((p0.x + p1.x) / 2 * w)
-        cy = int((p0.y + p1.y) / 2 * h)
-        return (cx, cy)
+                # Рисуем pinch indicator
+                if pinching:
+                    cv2.circle(frame, pinch_point, 15, (0, 255, 0), -1)
+                    cv2.circle(frame, pinch_point, 18, (0, 200, 0), 2)
+                else:
+                    cv2.circle(frame, pinch_point, 10, (0, 0, 255), -1)
 
-    def _draw_skeleton(self, frame: np.ndarray, landmarks, w: int, h: int) -> None:
+        return {'frame': frame, 'hands': hands}
+
+    def _draw_skeleton(self, frame, landmarks, w, h):
         points = [(int(lm.x * w), int(lm.y * h)) for lm in landmarks]
         for (i, j) in self.HAND_CONNECTIONS:
             cv2.line(frame, points[i], points[j], (0, 255, 0), 2)
         for pt in points:
             cv2.circle(frame, pt, 4, (0, 0, 255), -1)
 
-    def close(self) -> None:
+    def close(self):
         if hasattr(self, 'landmarker'):
             self.landmarker.close()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# AR-оверлей: warpPerspective
+# AR-оверлей
 # ──────────────────────────────────────────────────────────────────────────────
 
 class AROverlay:
-    """Накладывает картинку на кадр по 4 точкам через перспективное преобразование."""
-
     @staticmethod
     def _sort_corners(pts: list) -> list:
-        """Сортирует 4 точки: top-left, top-right, bottom-right, bottom-left."""
         arr = np.array(pts, dtype=np.float32)
         s = arr.sum(axis=1)
         d = np.diff(arr, axis=1).flatten()
@@ -261,7 +242,6 @@ class AROverlay:
 
     @staticmethod
     def _enforce_min_distance(pts: list, min_dist: float) -> list:
-        """Запрещает углам схлопываться ближе min_dist px."""
         result = [list(p) for p in pts]
         for i in range(4):
             for j in range(i + 1, 4):
@@ -269,7 +249,6 @@ class AROverlay:
                 dy = result[j][1] - result[i][1]
                 dist = (dx * dx + dy * dy) ** 0.5
                 if dist < min_dist:
-                    # Раздвигаем на min_dist
                     if dist < 1:
                         dx, dy = 1.0, 0.0
                         dist = 1.0
@@ -282,82 +261,17 @@ class AROverlay:
         return result
 
     @staticmethod
-    def palms_to_corners(palm1: tuple, palm2: tuple, padding: int,
-                         aspect_ratio: float, frame_w: int, frame_h: int) -> list:
-        """
-        Из двух центров ладоней строит 4 угла прямоугольника
-        с сохранением aspect_ratio картинки.
-        """
-        cx = (palm1[0] + palm2[0]) / 2
-        cy = (palm1[1] + palm2[1]) / 2
-
-        # Расстояние между ладонями
-        dx = palm2[0] - palm1[0]
-        dy = palm2[1] - palm1[1]
-        dist = (dx * dx + dy * dy) ** 0.5
-
-        if dist < 10:
-            dist = 10
-
-        # Угол поворота между ладонями
-        angle = np.arctan2(dy, dx)
-
-        # Ширина = расстояние + паддинг
-        img_w = dist + padding * 2
-        # Высота = по соотношению сторон картинки
-        img_h = img_w / aspect_ratio
-
-        # 4 угла прямоугольника (до поворота)
-        half_w = img_w / 2
-        half_h = img_h / 2
-        corners = np.array([
-            [-half_w, -half_h],
-            [half_w, -half_h],
-            [half_w, half_h],
-            [-half_w, half_h],
-        ], dtype=np.float32)
-
-        # Поворот
-        cos_a = np.cos(angle)
-        sin_a = np.sin(angle)
-        rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
-        corners = corners @ rot.T
-
-        # Сдвиг к центру
-        corners[:, 0] += cx
-        corners[:, 1] += cy
-
-        # Ограничиваем кадром
-        corners[:, 0] = np.clip(corners[:, 0], 0, frame_w - 1)
-        corners[:, 1] = np.clip(corners[:, 1], 0, frame_h - 1)
-
-        return corners.tolist()
-
-    @staticmethod
     def overlay(frame: np.ndarray, image: np.ndarray, pts_dst: list) -> np.ndarray:
-        """
-        frame  — кадр камеры (H, W, 3)
-        image  — картинка (h, w, 3|4)
-        pts_dst — 4 точки назначения [(x,y), ...]
-        """
         h_img, w_img = image.shape[:2]
-
-        # Добавляем альфа-канал если нет
         if image.shape[2] == 3:
-            alpha_channel = np.full((h_img, w_img, 1), 255, dtype=np.uint8)
-            image = np.concatenate([image, alpha_channel], axis=2)
+            alpha_ch = np.full((h_img, w_img, 1), 255, dtype=np.uint8)
+            image = np.concatenate([image, alpha_ch], axis=2)
 
-        pts_src = np.float32([
-            [0, 0],
-            [w_img, 0],
-            [w_img, h_img],
-            [0, h_img],
-        ])
+        pts_src = np.float32([[0, 0], [w_img, 0], [w_img, h_img], [0, h_img]])
         pts_dst = AROverlay._sort_corners(pts_dst)
         pts_dst_np = np.float32(pts_dst)
 
         M = cv2.getPerspectiveTransform(pts_src, pts_dst_np)
-
         h_frame, w_frame = frame.shape[:2]
         warped_rgb = cv2.warpPerspective(image[:, :, :3], M, (w_frame, h_frame))
         warped_alpha = cv2.warpPerspective(image[:, :, 3], M, (w_frame, h_frame))
@@ -368,7 +282,6 @@ class AROverlay:
         frame_f = frame.astype(np.float32)
         warped_f = warped_rgb.astype(np.float32)
         blended = (warped_f * alpha + frame_f * (1.0 - alpha)).astype(np.uint8)
-
         return blended
 
 
@@ -383,10 +296,16 @@ class FingerARApp:
         self.detector = HandDetector(cfg)
         self.overlay = AROverlay()
         self.cap: Optional[cv2.VideoCapture] = None
-        self.last_corners: Optional[list] = None
-        self.smoothed_corners: Optional[list] = None
+
+        # Текущие 4 угла картинки
+        self.corners: Optional[list] = None
+        self.smoothed: Optional[list] = None
         self.SMOOTH_FACTOR: float = 0.3
-        self.hand_mode: str = 'none'  # 'none' | 'single' | 'dual'
+
+        # Захват щипком: индекс угла (0-3) или None
+        self.grabbed_corner: Optional[int] = None
+
+        self.hand_mode: str = 'none'
         self.hand_lost_time: float = 0
         self.HAND_LOST_TIMEOUT: float = 1.0
 
@@ -400,9 +319,8 @@ class FingerARApp:
         return True
 
     def _draw_hud(self, frame: np.ndarray) -> None:
-        h, w = frame.shape[:2]
         overlay_img = frame.copy()
-        cv2.rectangle(overlay_img, (10, 10), (460, 160), (0, 0, 0), -1)
+        cv2.rectangle(overlay_img, (10, 10), (460, 170), (0, 0, 0), -1)
         cv2.addWeighted(overlay_img, 0.55, frame, 0.45, 0, frame)
 
         cv2.putText(frame, f"Картинка: {self.loader.current_name()}", (20, 40),
@@ -413,10 +331,14 @@ class FingerARApp:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
 
         if self.hand_mode == 'dual':
-            status = "Две руки — растяжение"
-            color = (255, 0, 255)
+            if self.grabbed_corner is not None:
+                status = f"Захват угла #{self.grabbed_corner + 1}"
+                color = (0, 255, 0)
+            else:
+                status = "Две руки — щипни угол!"
+                color = (255, 0, 255)
         elif self.hand_mode == 'single':
-            status = "Одна рука — перспектива"
+            status = "Правая рука — перспектива"
             color = (0, 255, 0)
         else:
             status = "Покажи руку!"
@@ -424,10 +346,8 @@ class FingerARApp:
 
         cv2.putText(frame, status, (20, 130),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-        if self.hand_mode == 'dual':
-            cv2.putText(frame, "Левая=якорь, правая=растяжение", (20, 155),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 200), 1)
+        cv2.putText(frame, "Левая рука: щипок=захват угла, тяни=растяжение", (20, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 200, 200), 1)
 
     def _save_screenshot(self, frame: np.ndarray) -> None:
         os.makedirs(self.cfg.screenshot_dir, exist_ok=True)
@@ -437,16 +357,28 @@ class FingerARApp:
         print(f"[Скриншот] {path}")
 
     def _smooth_corners(self, new_corners: list) -> list:
-        """Экспоненциальное сглаживание 4 углов."""
-        if self.smoothed_corners is None:
-            self.smoothed_corners = [list(p) for p in new_corners]
+        if self.smoothed is None:
+            self.smoothed = [list(p) for p in new_corners]
         else:
             for i in range(4):
-                old = self.smoothed_corners[i]
-                new = new_corners[i]
-                old[0] = old[0] * (1 - self.SMOOTH_FACTOR) + new[0] * self.SMOOTH_FACTOR
-                old[1] = old[1] * (1 - self.SMOOTH_FACTOR) + new[1] * self.SMOOTH_FACTOR
-        return [(int(p[0]), int(p[1])) for p in self.smoothed_corners]
+                s = self.smoothed[i]
+                n = new_corners[i]
+                s[0] = s[0] * (1 - self.SMOOTH_FACTOR) + n[0] * self.SMOOTH_FACTOR
+                s[1] = s[1] * (1 - self.SMOOTH_FACTOR) + n[1] * self.SMOOTH_FACTOR
+        return [(int(p[0]), int(p[1])) for p in self.smoothed]
+
+    def _find_nearest_corner(self, point: tuple, corners: list) -> tuple:
+        """Находит ближайший угол к точке. Возвращает (индекс, расстояние)."""
+        best_i = 0
+        best_d = float('inf')
+        for i, c in enumerate(corners):
+            dx = c[0] - point[0]
+            dy = c[1] - point[1]
+            d = (dx * dx + dy * dy) ** 0.5
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i, best_d
 
     def run(self) -> None:
         if not self._init_camera():
@@ -454,7 +386,7 @@ class FingerARApp:
 
         print("\n" + "=" * 50)
         print("  Finger AR Overlay — запущен!")
-        print("  1 рука = перспектива, 2 руки = растяжение")
+        print("  Правая = перспектива, левая = щипок угол")
         print("=" * 50 + "\n")
 
         try:
@@ -465,61 +397,85 @@ class FingerARApp:
 
                 frame = cv2.flip(frame, 1)
 
-                # Детекция рук
                 det = self.detector.process(frame)
                 frame = det['frame']
-                mode = det['mode']
+                hands = det['hands']
 
-                if mode == 'dual':
-                    # === ДВЕ РУКИ: растяжение между ладонями ===
-                    self.hand_mode = 'dual'
-                    self.hand_lost_time = 0
-                    image = self.loader.current()
-                    if image is not None:
-                        h_img, w_img = image.shape[:2]
-                        aspect = w_img / h_img if h_img > 0 else 1.0
-                        palms = det['palms']
-                        corners = self.overlay.palms_to_corners(
-                            palms[0], palms[1],
-                            self.cfg.two_hand_padding,
-                            aspect,
-                            frame.shape[1], frame.shape[0],
-                        )
-                        # Защита от схлопывания
-                        corners = self.overlay._enforce_min_distance(
-                            corners, self.cfg.min_corner_dist
-                        )
-                        self.last_corners = self._smooth_corners(corners)
-                        frame = self.overlay.overlay(frame, image, self.last_corners)
+                # Разделяем руки
+                right_hand = None
+                left_hand = None
+                for h_data in hands:
+                    if h_data['label'] == 'Right' and right_hand is None:
+                        right_hand = h_data
+                    elif h_data['label'] == 'Left' and left_hand is None:
+                        left_hand = h_data
 
-                elif mode == 'single':
-                    # === ОДНА РУКА: 4 кончика пальцев ===
-                    self.hand_mode = 'single'
+                image = self.loader.current()
+
+                if right_hand and image is not None:
+                    # Правая рука задает 4 угла картинки
+                    self.hand_mode = 'dual' if left_hand else 'single'
                     self.hand_lost_time = 0
-                    fingertips = det['fingertips']
-                    # Защита от схлопывания
-                    corners = self.overlay._enforce_min_distance(
-                        fingertips, self.cfg.min_corner_dist
+
+                    new_corners = self.overlay._enforce_min_distance(
+                        right_hand['fingertips'], self.cfg.min_corner_dist
                     )
-                    self.last_corners = self._smooth_corners(corners)
+                    self.corners = self._smooth_corners(new_corners)
 
-                    image = self.loader.current()
-                    if image is not None and self.last_corners is not None:
-                        frame = self.overlay.overlay(frame, image, self.last_corners)
+                    # Если левая рука есть — обрабатываем щипок
+                    if left_hand:
+                        pinch_pt = left_hand['pinch_point']
 
-                else:
-                    # === НЕТ РУК ===
+                        if left_hand['pinching']:
+                            if self.grabbed_corner is None:
+                                # Ищем ближайший угол
+                                idx, dist = self._find_nearest_corner(
+                                    pinch_pt, self.corners
+                                )
+                                if dist < self.cfg.grab_radius:
+                                    self.grabbed_corner = idx
+                                    print(f"[Захват] Угол #{idx + 1} (dist={dist:.0f}px)")
+
+                            # Тянем захваченный угол
+                            if self.grabbed_corner is not None:
+                                ci = self.grabbed_corner
+                                # Обновляем и smooth, и corners
+                                self.corners[ci] = list(pinch_pt)
+                                self.smoothed[ci] = list(pinch_pt)
+
+                        else:
+                            # Отпустили
+                            if self.grabbed_corner is not None:
+                                print(f"[Отпуск] Угол #{self.grabbed_corner + 1}")
+                                self.grabbed_corner = None
+
+                    else:
+                        self.grabbed_corner = None
+
+                    # Рисуем углы
+                    for i, (cx, cy) in enumerate(self.corners):
+                        if i == self.grabbed_corner:
+                            cv2.circle(frame, (cx, cy), 16, (0, 255, 0), -1)
+                            cv2.circle(frame, (cx, cy), 20, (0, 200, 0), 3)
+                        else:
+                            cv2.circle(frame, (cx, cy), 10, (0, 255, 255), -1)
+                            cv2.circle(frame, (cx, cy), 13, (0, 0, 255), 2)
+
+                    frame = self.overlay.overlay(frame, image, self.corners)
+
+                elif not right_hand and self.corners is not None:
+                    # Рука потеряна — держим позу
                     self.hand_lost_time += 1 / 30
                     if self.hand_lost_time > self.HAND_LOST_TIMEOUT:
                         self.hand_mode = 'none'
-                        self.smoothed_corners = None
-                        self.last_corners = None
-                    elif self.last_corners is not None:
-                        # Держим последнюю позу
-                        self.hand_mode = self.hand_mode  # сохраняем
-                        image = self.loader.current()
+                        self.corners = None
+                        self.smoothed = None
+                        self.grabbed_corner = None
+                    else:
                         if image is not None:
-                            frame = self.overlay.overlay(frame, image, self.last_corners)
+                            frame = self.overlay.overlay(frame, image, self.corners)
+                else:
+                    self.hand_mode = 'none'
 
                 self._draw_hud(frame)
                 cv2.imshow("Finger AR Overlay", frame)
@@ -544,10 +500,6 @@ class FingerARApp:
         cv2.destroyAllWindows()
         print("[Finger AR] Завершено.")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Точка входа
-# ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     app = FingerARApp()
